@@ -334,7 +334,7 @@ def refine_Tmin(T_min, V_physical, dV_physical, maxvev, log_10_precision = 6):
         return T_min
 
 
-def compute_logP_f(m, V_min_value, S3overT, v_w, units = 'GeV', cum_method='cumulative_simpson'):
+def compute_logP_f(m, V_min_value, S3overT, v_w, units = 'GeV', cum_method='cumulative_simpson', return_all = False):
     # Method
     # cum_method is kept for compatibility but the iterative approach uses trapezoidal rule
     
@@ -439,7 +439,10 @@ def compute_logP_f(m, V_min_value, S3overT, v_w, units = 'GeV', cum_method='cumu
         B_prev = ratio_V[i] * Gamma_list[i] / H[i] * np.exp(-J)
     
     # Reverse arrays to return in ascending order (Low T to High T) to match original behavior
-    return logP_f[::-1], Temps[::-1], ratio_V[::-1], Gamma_list[::-1], H[::-1], e_vacuum_full[::-1], e_radiation[::-1]  
+    if return_all:
+        return logP_f[::-1], Temps[::-1], ratio_V[::-1], Gamma_list[::-1], H[::-1], e_vacuum_full[::-1], e_radiation[::-1]  
+    else:
+        return logP_f[::-1], Temps[::-1], ratio_V[::-1], Gamma_list[::-1], H[::-1]
 
 
 def N_bubblesH(Temps, Gamma, logP_f, H, ratio_V):

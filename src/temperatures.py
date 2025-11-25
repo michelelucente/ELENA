@@ -336,24 +336,22 @@ def refine_Tmin(T_min, V_physical, dV_physical, maxvev, log_10_precision = 6):
 
 def compute_logP_f(m, V_min_value, S3overT, v_w, units = 'GeV', cum_method='cumulative_simpson'):
     # Method
-    if cum_method == 'cumulative_simpson':
-        cum_f = cumulative_simpson
-    else:
-        cum_f = cumulative_trapezoid 
-
+    # cum_method is kept for compatibility but the iterative approach uses trapezoidal rule
+    
     V = m.Vtot
 
-    Temps = np.array(sorted(V_min_value.keys(), reverse=False))  # Sorted x values
+    # Sort Temps descending (High T to Low T) for iterative computation
+    Temps = np.array(sorted(V_min_value.keys(), reverse=True))
     steps = len(Temps)
-    T_step = (Temps[-1] - Temps[0]) * 1e-3
+    T_step = (Temps[0] - Temps[-1]) * 1e-3 # Ensure positive step for derivative
     
-    dVdT = lambda phi, T : (V(np.array([phi]), T + T_step) - V(np.array([phi]), T - T_step)) / (2. * T_step) - s_SM(T)
+    dVdT = lambda phi, T : (V(np.array([phi]), T + T_step) - V(np.array([phi]), T - T_step)) / (2. * T_step) - s_SM(T, units = units)
     d2VdT2 = lambda phi, T : (dVdT(phi, T + T_step) - dVdT(phi, T - T_step)) / (2. * T_step)
     
-    # Hubble
-    e_vacuum = np.array([-V_min_value[t] for t in Temps]) 
+    # Precompute quantities that depend only on T (not on P_f)
+    e_vacuum_full = np.array([-V_min_value[t] for t in Temps])
+    
     e_radiation = np.pi**2 * g_rho(Temps / convert_units[units]) * Temps**4 / 30
-    H = np.sqrt((e_vacuum + e_radiation) / 3) / (M_pl * convert_units[units])
     
     # Action and Decay width
     S3_T = np.array([S3overT[t] for t in Temps])
@@ -362,24 +360,86 @@ def compute_logP_f(m, V_min_value, S3overT, v_w, units = 'GeV', cum_method='cumu
     # V''(phi_f, T) / V'(phi_f, T)
     ratio_V = np.array([d2VdT2(0, T) / dVdT(0, T) for T in Temps])
     
-    # To store result
+    # Initialize arrays
     logP_f = np.zeros_like(Temps)
+    H = np.zeros_like(Temps)
     
-    # Function for the first integral
-    f_ext = ratio_V * Gamma_list / H
+    # Initial condition at T_max (index 0)
+    # Assume P_f = 1 => logP_f = 0
+    logP_f[0] = 0.0
+    H[0] = np.sqrt((e_vacuum_full[0] + e_radiation[0]) / 3) / (M_pl * convert_units[units])
     
-    for i in range(steps - 1):
-        cum_ratio_V = cum_f(ratio_V[i:], x=Temps[i:], initial=0)
-        
-        f1 = ratio_V[i:] / H[i:] * np.exp(cum_ratio_V / 3.)
-        cum_f1 = cum_f(f1, x=Temps[i:], initial=0)
-        
-        f2 = f_ext[i:] * np.exp(- cum_ratio_V) * cum_f1**3
-        cum_f2 = cum_f(f2, x=Temps[i:], initial=0)
-        
-        logP_f[i] = - 4. / 243. * np.pi * v_w**3 * cum_f2[-1]
+    # Accumulators for integrals
+    # J: integral of ratio_V
+    # M: integral of A
+    # K0, K1, K2, K3: integrals of B * M^n
+    J = 0.0
+    M = 0.0
+    K0 = 0.0
+    K1 = 0.0
+    K2 = 0.0
+    K3 = 0.0
     
-    return logP_f, Temps, ratio_V, Gamma_list, H
+    # Previous values for trapezoidal rule
+    # A = ratio_V / H * exp(J/3)
+    # B = ratio_V * Gamma / H * exp(-J)
+    
+    A_prev = ratio_V[0] / H[0] * np.exp(J / 3.0) # J=0
+    B_prev = ratio_V[0] * Gamma_list[0] / H[0] * np.exp(-J) # J=0
+    
+    for i in range(1, steps):
+        dt = Temps[i] - Temps[i-1] # This is negative
+        
+        # Estimate H[i] using previous P_f
+        P_f_prev = np.exp(logP_f[i-1])
+        H[i] = np.sqrt((e_vacuum_full[i] * P_f_prev + e_radiation[i]) / 3) / (M_pl * convert_units[units])
+        
+        # Update J: integral of ratio_V from T_max to T_i
+        dJ = 0.5 * (ratio_V[i-1] + ratio_V[i]) * dt
+        J += dJ
+        
+        # Calculate current A and B
+        A_curr = ratio_V[i] / H[i] * np.exp(J / 3.0)
+        B_curr = ratio_V[i] * Gamma_list[i] / H[i] * np.exp(-J)
+        
+        # Update M: integral of A from T_max to T_i
+        dM = 0.5 * (A_prev + A_curr) * dt
+        M_prev_val = M # Store previous M for trapezoidal of K
+        M += dM
+        
+        # Update K integrals
+        # K0: integral of B
+        dK0 = 0.5 * (B_prev + B_curr) * dt
+        K0 += dK0
+        
+        # K1: integral of B * M
+        dK1 = 0.5 * (B_prev * M_prev_val + B_curr * M) * dt
+        K1 += dK1
+        
+        # K2: integral of B * M^2
+        dK2 = 0.5 * (B_prev * M_prev_val**2 + B_curr * M**2) * dt
+        K2 += dK2
+        
+        # K3: integral of B * M^3
+        dK3 = 0.5 * (B_prev * M_prev_val**3 + B_curr * M**3) * dt
+        K3 += dK3
+        
+        # Calculate L(T_i)
+        # L = - [ K3 - 3 M K2 + 3 M^2 K1 - M^3 K0 ]
+        L = - (K3 - 3 * M * K2 + 3 * M**2 * K1 - M**3 * K0)
+        
+        logP_f[i] = - 4. / 243. * np.pi * v_w**3 * L
+        
+        # Recompute H[i] with updated P_f
+        P_f_curr = np.exp(logP_f[i])
+        H[i] = np.sqrt((e_vacuum_full[i] * P_f_curr + e_radiation[i]) / 3) / (M_pl * convert_units[units])
+        
+        # Update prevs for next step
+        A_prev = ratio_V[i] / H[i] * np.exp(J / 3.0)
+        B_prev = ratio_V[i] * Gamma_list[i] / H[i] * np.exp(-J)
+    
+    # Reverse arrays to return in ascending order (Low T to High T) to match original behavior
+    return logP_f[::-1], Temps[::-1], ratio_V[::-1], Gamma_list[::-1], H[::-1], e_vacuum_full[::-1], e_radiation[::-1]  
 
 
 def N_bubblesH(Temps, Gamma, logP_f, H, ratio_V):

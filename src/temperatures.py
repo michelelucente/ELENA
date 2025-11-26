@@ -334,7 +334,7 @@ def refine_Tmin(T_min, V_physical, dV_physical, maxvev, log_10_precision = 6):
         return T_min
 
 
-def compute_logP_f(m, V_min_value, S3overT, v_w, units = 'GeV', cum_method='cumulative_simpson', return_all = False):
+def compute_logP_f(m, V_min_value, S3overT, true_vev, false_vev, v_w, units = 'GeV', cum_method='cumulative_simpson', return_all = False):
     # Method
     # cum_method is kept for compatibility but the iterative approach uses trapezoidal rule
     
@@ -357,17 +357,21 @@ def compute_logP_f(m, V_min_value, S3overT, v_w, units = 'GeV', cum_method='cumu
     S3_T = np.array([S3overT[t] for t in Temps])
     Gamma_list = Temps**4 * (S3_T / (2 * np.pi))**(3/2) * np.exp(-S3_T)
     
-    # V''(phi_f, T) / V'(phi_f, T)
-    ratio_V = np.array([d2VdT2(0, T) / dVdT(0, T) for T in Temps])
+    # V''(phi, T) / V'(phi, T) components
+    # ratio_V = P_f * ratio_V_false + (1 - P_f) * ratio_V_true
+    ratio_V_false = np.array([d2VdT2(false_vev[t], t) / dVdT(false_vev[t], t) for t in Temps])
+    ratio_V_true = np.array([d2VdT2(true_vev[t], t) / dVdT(true_vev[t], t) for t in Temps])
     
     # Initialize arrays
     logP_f = np.zeros_like(Temps)
     H = np.zeros_like(Temps)
+    ratio_V = np.zeros_like(Temps)
     
     # Initial condition at T_max (index 0)
     # Assume P_f = 1 => logP_f = 0
     logP_f[0] = 0.0
     H[0] = np.sqrt((e_vacuum_full[0] + e_radiation[0]) / 3) / (M_pl * convert_units[units])
+    ratio_V[0] = ratio_V_false[0]
     
     # Accumulators for integrals
     # J: integral of ratio_V
@@ -390,9 +394,10 @@ def compute_logP_f(m, V_min_value, S3overT, v_w, units = 'GeV', cum_method='cumu
     for i in range(1, steps):
         dt = Temps[i] - Temps[i-1] # This is negative
         
-        # Estimate H[i] using previous P_f
+        # Estimate H[i] and ratio_V[i] using previous P_f
         P_f_prev = np.exp(logP_f[i-1])
         H[i] = np.sqrt((e_vacuum_full[i] * P_f_prev + e_radiation[i]) / 3) / (M_pl * convert_units[units])
+        ratio_V[i] = ratio_V_false[i] * P_f_prev + ratio_V_true[i] * (1.0 - P_f_prev)
         
         # Update J: integral of ratio_V from T_max to T_i
         dJ = 0.5 * (ratio_V[i-1] + ratio_V[i]) * dt
@@ -429,10 +434,13 @@ def compute_logP_f(m, V_min_value, S3overT, v_w, units = 'GeV', cum_method='cumu
         L = - (K3 - 3 * M * K2 + 3 * M**2 * K1 - M**3 * K0)
         
         logP_f[i] = - 4. / 243. * np.pi * v_w**3 * L
+        # Ensure logP_f is non-positive (P_f <= 1)
+        logP_f[i] = np.minimum(logP_f[i], 0)
         
-        # Recompute H[i] with updated P_f
+        # Recompute H[i] and ratio_V[i] with updated P_f
         P_f_curr = np.exp(logP_f[i])
         H[i] = np.sqrt((e_vacuum_full[i] * P_f_curr + e_radiation[i]) / 3) / (M_pl * convert_units[units])
+        ratio_V[i] = ratio_V_false[i] * P_f_curr + ratio_V_true[i] * (1.0 - P_f_curr)
         
         # Update prevs for next step
         A_prev = ratio_V[i] / H[i] * np.exp(J / 3.0)

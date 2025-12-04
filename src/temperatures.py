@@ -347,8 +347,34 @@ def compute_logP_f(m, V_min_value, S3overT, v_w, units = 'GeV', cum_method='cumu
     steps = len(Temps)
     T_step = (Temps[-1] - Temps[0]) * 1e-3
     
-    dVdT = lambda phi, T : (V(np.array([phi]), T + T_step) - V(np.array([phi]), T - T_step)) / (2. * T_step) - s_SM(T)
-    d2VdT2 = lambda phi, T : (dVdT(phi, T + T_step) - dVdT(phi, T - T_step)) / (2. * T_step)
+    # Numerically stable thermal derivatives that avoid unphysical negative T
+    def finite_dVdT(phi, T, step=T_step):
+        # Use central difference when possible, otherwise one-sided at the boundary
+        Tm = max(T - step, 0.0)
+        Tp = T + step
+        if Tm == T:  # T == 0: forward difference
+            return (V(np.array([phi]), Tp) - V(np.array([phi]), T)) / step - s_SM(T, units=units)
+        return (V(np.array([phi]), Tp) - V(np.array([phi]), Tm)) / (Tp - Tm) - s_SM(T, units=units)
+
+    def finite_d2VdT2(phi, T):
+        # Use a smaller step for the second derivative to reduce finite-difference noise
+        step2 = T_step * 0.5
+        Tm = max(T - step2, 0.0)
+        Tp = T + step2
+        if Tm == T:
+            # Forward second derivative: f(T), f(T+step), f(T+2*step)
+            Tpp = T + 2 * step2
+            f0 = finite_dVdT(phi, T, step2)
+            f1 = finite_dVdT(phi, Tp, step2)
+            f2 = finite_dVdT(phi, Tpp, step2)
+            return (f2 - 2 * f1 + f0) / (step2**2)
+        # Central difference on the first derivative
+        f_plus = finite_dVdT(phi, Tp, step2)
+        f_minus = finite_dVdT(phi, Tm, step2)
+        return (f_plus - f_minus) / (Tp - Tm)
+
+    dVdT = lambda phi, T: finite_dVdT(phi, T)
+    d2VdT2 = lambda phi, T: finite_d2VdT2(phi, T)
     
     # Hubble
     e_vacuum = np.array([-V_min_value[t] for t in Temps]) 

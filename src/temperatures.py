@@ -344,9 +344,35 @@ def compute_logP_f(m, V_min_value, S3overT, true_vev, false_vev, v_w, units = 'G
     Temps = np.array(sorted(V_min_value.keys(), reverse=True))
     steps = len(Temps)
     T_step = (Temps[0] - Temps[-1]) * 1e-3 # Ensure positive step for derivative
-    
-    dVdT = lambda phi, T : (V(np.array([phi]), T + T_step) - V(np.array([phi]), T - T_step)) / (2. * T_step) - s_SM(T, units = units)
-    d2VdT2 = lambda phi, T : (dVdT(phi, T + T_step) - dVdT(phi, T - T_step)) / (2. * T_step)
+
+    # Numerically stable thermal derivatives that avoid unphysical negative T
+    def finite_dVdT(phi, T, step=T_step):
+        # Use central difference when possible, otherwise one-sided at the boundary
+        Tm = max(T - step, 0.0)
+        Tp = T + step
+        if Tm == T:  # T == 0: forward difference
+            return (V(np.array([phi]), Tp) - V(np.array([phi]), T)) / step - s_SM(T, units=units)
+        return (V(np.array([phi]), Tp) - V(np.array([phi]), Tm)) / (Tp - Tm) - s_SM(T, units=units)
+
+    def finite_d2VdT2(phi, T):
+        # Use a smaller step for the second derivative to reduce finite-difference noise
+        step2 = T_step * 0.5
+        Tm = max(T - step2, 0.0)
+        Tp = T + step2
+        if Tm == T:
+            # Forward second derivative: f(T), f(T+step), f(T+2*step)
+            Tpp = T + 2 * step2
+            f0 = finite_dVdT(phi, T, step2)
+            f1 = finite_dVdT(phi, Tp, step2)
+            f2 = finite_dVdT(phi, Tpp, step2)
+            return (f2 - 2 * f1 + f0) / (step2**2)
+        # Central difference on the first derivative
+        f_plus = finite_dVdT(phi, Tp, step2)
+        f_minus = finite_dVdT(phi, Tm, step2)
+        return (f_plus - f_minus) / (Tp - Tm)
+
+    dVdT = lambda phi, T: finite_dVdT(phi, T)
+    d2VdT2 = lambda phi, T: finite_d2VdT2(phi, T)
     
     # Precompute quantities that depend only on T (not on P_f)
     e_vacuum_full = np.array([-V_min_value[t] for t in Temps])
@@ -451,6 +477,139 @@ def compute_logP_f(m, V_min_value, S3overT, true_vev, false_vev, v_w, units = 'G
         return logP_f[::-1], Temps[::-1], ratio_V[::-1], Gamma_list[::-1], H[::-1], e_vacuum_full[::-1], e_radiation[::-1]  
     else:
         return logP_f[::-1], Temps[::-1], ratio_V[::-1], Gamma_list[::-1], H[::-1]
+
+def compute_logP_f2(m, V_min_value, S3overT, true_vev, false_vev, v_w, units = 'GeV', cum_method='cumulative_simpson', return_all = False):
+    # Implements the general dt/dT = -(1/(3H)) (d rho / dT)/(rho + p) with phase mixing
+    V = m.Vtot
+
+    Temps = np.array(sorted(set(V_min_value.keys()), reverse=True))
+    steps = len(Temps)
+    T_step = (Temps[0] - Temps[-1]) * 1e-3
+
+    dVdT = lambda phi, T : (V(np.array([phi]), T + T_step) - V(np.array([phi]), T - T_step)) / (2. * T_step) - s_SM(T, units = units)
+    d2VdT2 = lambda phi, T : (dVdT(phi, T + T_step) - dVdT(phi, T - T_step)) / (2. * T_step)
+
+    def safe_div(num, den):
+        return np.where(np.abs(den) > 1e-300, num / den, np.nan)
+
+    # Basic building blocks
+    e_vacuum_full = np.array([-V_min_value[t] for t in Temps])
+    e_radiation = np.pi**2 * g_rho(Temps / convert_units[units]) * Temps**4 / 30
+    de_radiation_dT = np.gradient(e_radiation, Temps)
+    S3_T = np.array([S3overT[t] for t in Temps])
+    Gamma_list = Temps**4 * (S3_T / (2 * np.pi))**(3/2) * np.exp(-S3_T)
+
+    # Evaluate thermodynamic quantities at false and true minima
+    V_false = np.array([V(np.array([false_vev[t]]), t).reshape(-1)[0] for t in Temps])
+    V_true = np.array([V(np.array([true_vev[t]]), t).reshape(-1)[0] for t in Temps])
+
+    dVdT_false = np.array([dVdT(false_vev[t], t) for t in Temps])
+    dVdT_true = np.array([dVdT(true_vev[t], t) for t in Temps])
+    d2VdT2_false = np.array([d2VdT2(false_vev[t], t) for t in Temps])
+    d2VdT2_true = np.array([d2VdT2(true_vev[t], t) for t in Temps])
+
+    rho_false = V_false - Temps * dVdT_false
+    rho_true = V_true - Temps * dVdT_true
+    p_false = -V_false
+    p_true = -V_true
+    drho_dT_false = -Temps * d2VdT2_false
+    drho_dT_true = -Temps * d2VdT2_true
+
+    enthalpy_false = rho_false + p_false
+    enthalpy_true = rho_true + p_true
+
+    ratio_rho = np.zeros_like(Temps)
+    H = np.zeros_like(Temps)
+    rho_tot_arr = np.zeros_like(Temps)
+    enthalpy_tot_arr = np.zeros_like(Temps)
+
+    rho_floor = 1e-120
+    enthalpy_floor = 1e-120
+
+    def mix_tot(idx, P_curr):
+        rho_mix = rho_false[idx] * P_curr + rho_true[idx] * (1.0 - P_curr)
+        enthalpy_mix = enthalpy_false[idx] * P_curr + enthalpy_true[idx] * (1.0 - P_curr)
+        rho_tot = rho_mix + e_radiation[idx]
+        enthalpy_tot = enthalpy_mix + 4.0/3.0 * e_radiation[idx]
+        return rho_tot, enthalpy_tot
+
+    def drho_tot(idx, rho_curr, rho_prev=None, dP_term=None):
+        if idx == 0:
+            return drho_dT_false[0] + de_radiation_dT[0]
+        if rho_prev is None:
+            return np.nan
+        dT = Temps[idx] - Temps[idx-1]
+        return (rho_curr - rho_prev) / dT if dT != 0 else np.nan
+
+    # Initial condition P_f = 1
+    logP_f = np.zeros_like(Temps)
+    rho_tot_arr[0], enthalpy_tot_arr[0] = mix_tot(0, 1.0)
+    ratio_rho[0] = safe_div(drho_dT_false[0] + de_radiation_dT[0], np.where(np.abs(enthalpy_tot_arr[0]) > enthalpy_floor, enthalpy_tot_arr[0], np.nan))
+    H[0] = np.sqrt(np.maximum(rho_tot_arr[0], rho_floor) / 3) / (M_pl * convert_units[units])
+
+    # Accumulators
+    J = 0.0
+    M = 0.0
+    K0 = 0.0
+    K1 = 0.0
+    K2 = 0.0
+    K3 = 0.0
+
+    A_prev = ratio_rho[0] / H[0] * np.exp(J / 3.0)
+    B_prev = ratio_rho[0] * Gamma_list[0] / H[0] * np.exp(-J)
+
+    for i in range(1, steps):
+        dt = Temps[i] - Temps[i-1]
+        P_f_prev = np.exp(logP_f[i-1])
+
+        # Ratio at T_i estimated with previous P_f using finite difference of rho_tot
+        rho_tot_step, enthalpy_tot_step = mix_tot(i, P_f_prev)
+        drho_tot_step = drho_tot(i, rho_tot_step, rho_tot_arr[i-1])
+        ratio_step_curr = safe_div(drho_tot_step, np.where(np.abs(enthalpy_tot_step) > enthalpy_floor, enthalpy_tot_step, np.nan))
+        H[i] = np.sqrt(np.maximum(rho_tot_step, rho_floor) / 3) / (M_pl * convert_units[units])
+
+        dJ = 0.5 * (ratio_rho[i-1] + ratio_step_curr) * dt
+        J += dJ
+        A_curr = ratio_step_curr / H[i] * np.exp(J / 3.0)
+        B_curr = ratio_step_curr * Gamma_list[i] / H[i] * np.exp(-J)
+
+        dM = 0.5 * (A_prev + A_curr) * dt
+        M_prev_val = M
+        M += dM
+
+        dK0 = 0.5 * (B_prev + B_curr) * dt
+        K0 += dK0
+
+        dK1 = 0.5 * (B_prev * M_prev_val + B_curr * M) * dt
+        K1 += dK1
+
+        dK2 = 0.5 * (B_prev * M_prev_val**2 + B_curr * M**2) * dt
+        K2 += dK2
+
+        dK3 = 0.5 * (B_prev * M_prev_val**3 + B_curr * M**3) * dt
+        K3 += dK3
+
+        L = - (K3 - 3 * M * K2 + 3 * M**2 * K1 - M**3 * K0)
+
+        logP_f[i] = - 4. / 243. * np.pi * v_w**3 * L
+        logP_f[i] = np.minimum(logP_f[i], 0)
+
+        P_f_curr = np.exp(logP_f[i])
+        rho_tot_curr, enthalpy_tot_curr = mix_tot(i, P_f_curr)
+        rho_tot_arr[i] = rho_tot_curr
+        enthalpy_tot_arr[i] = enthalpy_tot_curr
+        drho_tot_curr = drho_tot(i, rho_tot_curr, rho_tot_arr[i-1])
+        ratio_rho[i] = safe_div(drho_tot_curr, np.where(np.abs(enthalpy_tot_curr) > enthalpy_floor, enthalpy_tot_curr, np.nan))
+
+        H[i] = np.sqrt(np.maximum(rho_tot_curr, rho_floor) / 3) / (M_pl * convert_units[units])
+
+        A_prev = ratio_rho[i] / H[i] * np.exp(J / 3.0)
+        B_prev = ratio_rho[i] * Gamma_list[i] / H[i] * np.exp(-J)
+
+    if return_all:
+        return logP_f[::-1], Temps[::-1], ratio_rho[::-1], Gamma_list[::-1], H[::-1], e_vacuum_full[::-1], e_radiation[::-1]  
+    else:
+        return logP_f[::-1], Temps[::-1], ratio_rho[::-1], Gamma_list[::-1], H[::-1]
 
 
 def N_bubblesH(Temps, Gamma, logP_f, H, ratio_V):

@@ -344,36 +344,95 @@ class model(generic_potential.generic_potential):
             dVdT *= 1./(12*T_eps)
         
         return self.Vtot(X,T, include_radiation) - T * dVdT
-    
-    
+
+    def _d1_dT(self, func, T0):
+        """
+        Temperature derivative with a 5-point stencil (O(h^4)).
+        Falls back to a forward stencil close to T=0 to avoid negative temperatures.
+        """
+        T0 = np.asanyarray(T0, dtype=float)
+        T_flat = T0.ravel()
+        h = self.T_eps
+        deriv = np.empty_like(T_flat, dtype=float)
+
+        central_mask = T_flat >= 2 * h
+        if np.any(central_mask):
+            Tc = T_flat[central_mask]
+            f_m2 = func(np.maximum(Tc - 2 * h, 0.0))
+            f_m1 = func(np.maximum(Tc - h, 0.0))
+            f_p1 = func(Tc + h)
+            f_p2 = func(Tc + 2 * h)
+            deriv[central_mask] = (-f_p2 + 8 * f_p1 - 8 * f_m1 + f_m2) / (12 * h)
+
+        edge_mask = ~central_mask
+        if np.any(edge_mask):
+            Te = T_flat[edge_mask]
+            f0 = func(Te)
+            f1 = func(Te + h)
+            f2 = func(Te + 2 * h)
+            f3 = func(Te + 3 * h)
+            f4 = func(Te + 4 * h)
+            deriv[edge_mask] = (-25 * f0 + 48 * f1 - 36 * f2 + 16 * f3 - 3 * f4) / (12 * h)
+
+        return deriv.reshape(T0.shape)
+
+
+    def _d2_dT2(self, func, T0):
+        """
+        Second temperature derivative with a 5-point stencil (O(h^4)).
+        Uses a forward stencil close to T=0 to avoid stepping to negative temperatures.
+        """
+        T0 = np.asanyarray(T0, dtype=float)
+        T_flat = T0.ravel()
+        h = self.T_eps
+        deriv = np.empty_like(T_flat, dtype=float)
+
+        central_mask = T_flat >= 2 * h
+        if np.any(central_mask):
+            Tc = T_flat[central_mask]
+            f_m2 = func(np.maximum(Tc - 2 * h, 0.0))
+            f_m1 = func(np.maximum(Tc - h, 0.0))
+            f0 = func(Tc)
+            f_p1 = func(Tc + h)
+            f_p2 = func(Tc + 2 * h)
+            deriv[central_mask] = (-f_p2 + 16 * f_p1 - 30 * f0 + 16 * f_m1 - f_m2) / (12 * h**2)
+
+        edge_mask = ~central_mask
+        if np.any(edge_mask):
+            Te = T_flat[edge_mask]
+            f0 = func(Te)
+            f1 = func(Te + h)
+            f2 = func(Te + 2 * h)
+            f3 = func(Te + 3 * h)
+            f4 = func(Te + 4 * h)
+            deriv[edge_mask] = (35 * f0 - 104 * f1 + 114 * f2 - 56 * f3 + 11 * f4) / (12 * h**2)
+
+        return deriv.reshape(T0.shape)
+
+
     def dVdT(self, X, T0, include_radiation=True, include_SM = False, units = 'GeV'):
         T0 = np.asanyarray(T0, dtype=float)
         X = [X]
-        
         V = lambda T : self.Vtot(X, T, include_radiation=include_radiation)
-        T_eps = self.T_eps
-        
-        dVdT = V(T0+T_eps)
-        dVdT -= V(T0-T_eps)
-        dVdT *= 1./(2*T_eps)
+
+        dVdT = self._d1_dT(V, T0)
 
         if include_SM:
-            dVdT += - s_SM(T0, units=units)
+            dVdT -= s_SM(T0, units=units)
         
         return dVdT
     
     
     def d2VdT2(self, X, T0, include_radiation=True, include_SM = False, units = 'GeV'):
         T0 = np.asanyarray(T0, dtype=float)
-        X = X
-        
-        dV = lambda T : self.dVdT(X, T, include_radiation=include_radiation, include_SM = include_SM, units=units)
-        T_eps = self.T_eps
-        
-        d2V = dV(T0+T_eps)
-        d2V -= dV(T0-T_eps)
-        d2V *= 1./(2*T_eps)
-        
+        X = [X]
+
+        V = lambda T : self.Vtot(X, T, include_radiation=include_radiation)
+        d2V = self._d2_dT2(V, T0)
+
+        if include_SM:
+            d2V -= self._d1_dT(lambda T: s_SM(T, units=units), T0)
+
         return d2V
     
     def e_minus_3p_div_4(self,X,T,include_radiation=True):

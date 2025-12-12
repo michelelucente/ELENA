@@ -602,6 +602,222 @@ def compute_logP_f2(m, V_min_value, S3overT, true_vev, false_vev, v_w, units = '
         return logP_f[::-1], Temps[::-1], ratio_V[::-1], Gamma_list[::-1], H[::-1]
 
 
+def compute_logP_f3(m, V_min_value, S3overT, true_vev, false_vev, v_w, units = 'GeV', return_all = False):
+    """
+    Same integration logic as compute_logP_f2, but using the thermodynamic ratio
+    (d rho / d T) / (rho + p) with mixed phases.
+    
+    The integration uses the phase-weighted ratio_V without the latent heat contribution
+    to avoid feedback loops. The latent heat term dP_f/dT is computed analytically from
+    the integral formula and only affects the output ratio_V, not the integration itself.
+    
+    Mathematical note: dP_f/dT = P_f * d(logP_f)/dT, where d(logP_f)/dT is the derivative
+    of the integral. We compute this in log-space to avoid 0 * inf when P_f is very small.
+    """
+    V = m.Vtot
+
+    # Sort Temps descending (High T to Low T) for iterative computation
+    Temps = np.array(sorted(V_min_value.keys(), reverse=True))
+    steps = len(Temps)
+
+    # Stable derivatives from the model (already handle forward stencil at T=0)
+    def dVdT(phi, T):
+        return m.dVdT(np.array([phi]), T, include_radiation=True, include_SM=True, units=units)
+
+    def d2VdT2(phi, T):
+        return m.d2VdT2(np.array([phi]), T, include_radiation=True, include_SM=True, units=units)
+
+    def V_at(phi, T):
+        return V(np.array([phi]), T)
+
+    # Precompute thermodynamic quantities for false/true phases
+    rho_f = np.zeros(steps)
+    rho_t = np.zeros(steps)
+    p_f = np.zeros(steps)
+    p_t = np.zeros(steps)
+    drho_f = np.zeros(steps)
+    drho_t = np.zeros(steps)
+
+    for idx, T in enumerate(Temps):
+        vf = false_vev[T]
+        vt = true_vev[T]
+
+        V_f = V_at(vf, T)
+        V_t = V_at(vt, T)
+        dV_f = dVdT(vf, T)
+        dV_t = dVdT(vt, T)
+        d2V_f = d2VdT2(vf, T)
+        d2V_t = d2VdT2(vt, T)
+
+        rho_f[idx] = V_f - T * dV_f
+        rho_t[idx] = V_t - T * dV_t
+        p_f[idx] = -V_f
+        p_t[idx] = -V_t
+        drho_f[idx] = -T * d2V_f
+        drho_t[idx] = -T * d2V_t
+
+    rho_plus_p_f = rho_f + p_f
+    rho_plus_p_t = rho_t + p_t
+    
+    # Difference in energy density between phases (latent heat related)
+    delta_rho = rho_f - rho_t
+
+    # Radiation (SM) term, same for both phases
+    e_radiation = np.pi**2 * g_rho(Temps / convert_units[units]) * Temps**4 / 30
+    
+    # For Hubble parameter calculation, use e_vacuum = -V_min_value approach
+    # (consistent with compute_logP_f1 and compute_logP_f2)
+    # This avoids issues with negative rho_t that can make sqrt argument negative
+    e_vacuum_full = np.array([-V_min_value[t] for t in Temps])
+
+    # Action and Decay width
+    S3_T = np.array([S3overT[t] for t in Temps])
+    Gamma_list = Temps**4 * (S3_T / (2 * np.pi))**(3/2) * np.exp(-S3_T)
+
+    # Initialize arrays
+    logP_f = np.zeros_like(Temps)
+    H = np.zeros_like(Temps)
+    ratio_V = np.zeros_like(Temps)
+    ratio_V_base = np.zeros_like(Temps)  # Without latent heat term
+    rho_full = np.zeros_like(Temps)
+    p_full = np.zeros_like(Temps)
+
+    mix = lambda arr_f, arr_t, P: arr_f * P + arr_t * (1.0 - P)
+    c_pref = - 4. / 243. * np.pi * v_w**3
+
+    # Helper function to compute dP_f/dT = P_f * dlogP_dT in a numerically stable way
+    def compute_dP_dT(logP, dlogP_dT):
+        """
+        Compute dP_f/dT = exp(logP) * dlogP_dT in a stable way using log-space.
+        Returns 0 when the result would underflow.
+        """
+        if dlogP_dT == 0:
+            return 0.0
+        # Compute in log space: log(|dP/dT|) = logP + log(|dlogP/dT|)
+        log_abs_dP_dT = logP + np.log(np.abs(dlogP_dT))
+        sign = np.sign(dlogP_dT)
+        return sign * np.exp(log_abs_dP_dT)
+
+    # Initial condition at T_max (index 0): P_f = 1 => logP_f = 0
+    rho_full[0] = rho_f[0]
+    p_full[0] = p_f[0]
+    ratio_V_base[0] = drho_f[0] / rho_plus_p_f[0]
+    ratio_V[0] = ratio_V_base[0]
+    H[0] = np.sqrt((e_vacuum_full[0] + e_radiation[0]) / 3) / (M_pl * convert_units[units])
+
+    # Accumulators for integrals
+    J = 0.0
+    M = 0.0
+    K0 = 0.0
+    K1 = 0.0
+    K2 = 0.0
+    K3 = 0.0
+
+    drho3 = np.zeros_like(Temps)
+    rhoplusp3 = np.zeros_like(Temps)
+    P3 = np.zeros_like(Temps)
+    dlogP3 = np.zeros_like(Temps)
+
+    A_prev = ratio_V_base[0] / H[0] * np.exp(J / 3.0)  # J=0
+    B_prev = ratio_V_base[0] * Gamma_list[0] / H[0] * np.exp(-J)  # J=0
+
+    for i in range(1, steps):
+        dt = Temps[i] - Temps[i-1]  # Negative
+
+        # Derivative of logP_f at previous step: d(logP_f)/dT = c_pref * B * M^3
+        dlogP_prev_dT = c_pref * B_prev * (M**3)
+
+        # Use previous P_f to estimate current ratios/H
+        logP_prev = logP_f[i-1]
+        P_prev = np.exp(logP_prev)
+        
+        # Base drho_mix without latent heat term (for integration stability)
+        drho_mix_base = P_prev * drho_f[i] + (1.0 - P_prev) * drho_t[i]
+        
+        rho_p_mix = mix(rho_plus_p_f[i], rho_plus_p_t[i], P_prev)
+        rho_full[i] = mix(rho_f[i], rho_t[i], P_prev)
+        p_full[i] = mix(p_f[i], p_t[i], P_prev)
+
+        # Use base ratio_V for integration to avoid feedback
+        ratio_V_base[i] = drho_mix_base / rho_p_mix
+        
+        # Store diagnostic info
+        P3[i] = P_prev
+        dlogP3[i] = dlogP_prev_dT
+
+        # Use e_vacuum_full for H calculation (consistent with compute_logP_f1/f2)
+        e_vacuum_mix = e_vacuum_full[i] * P_prev
+        H[i] = np.sqrt((e_vacuum_mix + e_radiation[i]) / 3) / (M_pl * convert_units[units])
+
+        # Update J: integral of ratio_V_base from T_max to T_i
+        dJ = 0.5 * (ratio_V_base[i-1] + ratio_V_base[i]) * dt
+        J += dJ
+
+        # Calculate current A and B using base ratio_V
+        A_curr = ratio_V_base[i] / H[i] * np.exp(J / 3.0)
+        B_curr = ratio_V_base[i] * Gamma_list[i] / H[i] * np.exp(-J)
+
+        # Update M: integral of A from T_max to T_i
+        dM = 0.5 * (A_prev + A_curr) * dt
+        M_prev_val = M
+        M += dM
+
+        # Update K integrals
+        dK0 = 0.5 * (B_prev + B_curr) * dt
+        K0 += dK0
+
+        dK1 = 0.5 * (B_prev * M_prev_val + B_curr * M) * dt
+        K1 += dK1
+
+        dK2 = 0.5 * (B_prev * M_prev_val**2 + B_curr * M**2) * dt
+        K2 += dK2
+
+        dK3 = 0.5 * (B_prev * M_prev_val**3 + B_curr * M**3) * dt
+        K3 += dK3
+
+        # Calculate L(T_i)
+        L = - (K3 - 3 * M * K2 + 3 * M**2 * K1 - M**3 * K0)
+
+        logP_f[i] = c_pref * L
+        logP_f[i] = np.minimum(logP_f[i], 0)
+
+        # Recompute with updated P_f for next iteration (corrector step)
+        logP_curr = logP_f[i]
+        P_curr = np.exp(logP_curr)
+        dlogP_curr_dT = c_pref * B_curr * (M**3)
+        
+        # Update base quantities with corrected P_f
+        drho_mix_base = P_curr * drho_f[i] + (1.0 - P_curr) * drho_t[i]
+        rho_p_mix = mix(rho_plus_p_f[i], rho_plus_p_t[i], P_curr)
+        rho_full[i] = mix(rho_f[i], rho_t[i], P_curr)
+        p_full[i] = mix(p_f[i], p_t[i], P_curr)
+        ratio_V_base[i] = drho_mix_base / rho_p_mix
+        
+        # Use e_vacuum_full for H calculation (consistent with compute_logP_f1/f2)
+        e_vacuum_mix = e_vacuum_full[i] * P_curr
+        H[i] = np.sqrt((e_vacuum_mix + e_radiation[i]) / 3) / (M_pl * convert_units[units])
+
+        # Now compute the full ratio_V with latent heat term for output
+        dP_curr_dT = compute_dP_dT(logP_curr, dlogP_curr_dT)
+        latent_heat_term = delta_rho[i] * dP_curr_dT
+        drho_mix_full = drho_mix_base + latent_heat_term
+        ratio_V[i] = drho_mix_full / rho_p_mix
+        
+        drho3[i] = drho_mix_full
+        rhoplusp3[i] = rho_p_mix
+
+        # Use base ratio_V for next step integration
+        A_prev = ratio_V_base[i] / H[i] * np.exp(J / 3.0)
+        B_prev = ratio_V_base[i] * Gamma_list[i] / H[i] * np.exp(-J)
+
+    # Reverse arrays to return in ascending order (Low T to High T) to match original behavior
+    if return_all:
+        return (logP_f[::-1], Temps[::-1], ratio_V[::-1], Gamma_list[::-1], H[::-1],
+                rho_full[::-1], p_full[::-1], e_radiation[::-1])
+    else:
+        return logP_f[::-1], Temps[::-1], ratio_V[::-1], Gamma_list[::-1], H[::-1], drho3[::-1], rhoplusp3[::-1], P3[::-1], dlogP3[::-1]
+
+
 def N_bubblesH(Temps, Gamma, logP_f, H, ratio_V):
     integrand = Gamma * np.exp(logP_f) * ratio_V / H**4
     integral = cumulative_trapezoid(np.flip(integrand), initial=0, x=np.flip(Temps))

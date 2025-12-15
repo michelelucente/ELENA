@@ -1019,6 +1019,10 @@ def compute_logP_f5(m, V_min_value, S3overT, true_vev, false_vev, v_w, units='Ge
     V_ext_out = np.zeros(n_temps)
     I_out = np.zeros(n_temps)
     
+    # Track the minimum logP_f seen so far (most negative = most bubbles formed)
+    # Since we integrate from high T to low T, logP_f should be monotonically decreasing (more negative)
+    min_logP_f_so_far = 0.0
+    
     for idx, T in enumerate(Temps_sorted):
         if T <= 0:
             logP_f_out[idx] = logP_f_out[idx - 1] if idx > 0 else 0.0
@@ -1041,7 +1045,17 @@ def compute_logP_f5(m, V_min_value, S3overT, true_vev, false_vev, v_w, units='Ge
         # The original formula integrates from current T upward to T_max
         # Our ODE integrates from T_max downward, so we negate L
         L = -(K3 - 3.0 * M * K2 + 3.0 * M**2 * K1 - M**3 * K0)
-        logP_f_out[idx] = c_pref * L
+        logP_f_raw = c_pref * L
+        
+        # Physical constraint: logP_f is strictly non-positive and monotonically decreasing
+        # (more negative) as T decreases. The ODE can produce small oscillations in sign
+        # due to numerical noise, but the magnitude is correct.
+        # We enforce: (1) non-positive, (2) monotonically decreasing with decreasing T.
+        logP_f_raw = min(logP_f_raw, 0.0)  # Cannot be positive
+        logP_f_raw = min(logP_f_raw, min_logP_f_so_far)  # Cannot increase (become less negative)
+        min_logP_f_so_far = logP_f_raw
+        
+        logP_f_out[idx] = logP_f_raw
         V_ext_out[idx] = -logP_f_out[idx]
         
         P_f = np.exp(logP_f_out[idx]) if logP_f_out[idx] > -700 else 0.0

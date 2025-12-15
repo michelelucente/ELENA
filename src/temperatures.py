@@ -1,5 +1,6 @@
 import numpy as np
-from scipy.integrate import cumulative_trapezoid, trapezoid
+from scipy.integrate import cumulative_trapezoid, trapezoid, solve_ivp
+from scipy.interpolate import interp1d
 try:
     from scipy.integrate import cumulative_simpson
 except:
@@ -816,6 +817,262 @@ def compute_logP_f3(m, V_min_value, S3overT, true_vev, false_vev, v_w, units = '
                 rho_full[::-1], p_full[::-1], e_radiation[::-1])
     else:
         return logP_f[::-1], Temps[::-1], ratio_V[::-1], Gamma_list[::-1], H[::-1], drho3[::-1], rhoplusp3[::-1], P3[::-1], dlogP3[::-1]
+
+
+def compute_logP_f5(m, V_min_value, S3overT, true_vev, false_vev, v_w, units='GeV', return_all=False):
+    """
+    Numerically stable computation of log(P_f) using the exact temperature Jacobian.
+
+    The integral formula is V_ext(T) where P_f(T) = exp(-V_ext(T)).
+    
+    The key insight is to compute the ratio R = (dρ/dT) / (ρ+p) and Hubble H
+    self-consistently with P_f at each step.
+
+    For the Hubble parameter:
+        H² = (ρ_rad + P_f * ε_vac) / 3 / M_pl²
+    where ε_vac is the vacuum energy density that only exists in the false vacuum phase.
+
+    For the thermodynamic quantities:
+        ρ = P_f * ρ_f + (1 - P_f) * ρ_t + ρ_rad
+        p = P_f * p_f + (1 - P_f) * p_t + p_rad
+        
+    where ρ_f, p_f are computed at the false vacuum, ρ_t, p_t at the true vacuum.
+
+    The approach uses scipy's solve_ivp with an ODE formulation to ensure stability.
+    """
+    V = m.Vtot
+
+    # Sort temperatures descending (high T to low T = forward in time)
+    Temps_sorted = np.array(sorted(V_min_value.keys(), reverse=True))
+    n_temps = len(Temps_sorted)
+
+    if n_temps == 0:
+        empty = np.array([])
+        if return_all:
+            return (empty,) * 12
+        return empty, empty, empty, empty, empty
+
+    # Precompute phase-specific thermodynamic quantities
+    rho_f_arr = np.zeros(n_temps)
+    rho_t_arr = np.zeros(n_temps)
+    p_f_arr = np.zeros(n_temps)
+    p_t_arr = np.zeros(n_temps)
+    drho_dT_f_arr = np.zeros(n_temps)
+    drho_dT_t_arr = np.zeros(n_temps)
+
+    for idx, T in enumerate(Temps_sorted):
+        phi_f = false_vev[T]
+        phi_t = true_vev[T]
+
+        V_at_f = V(np.array([phi_f]), T)
+        V_at_t = V(np.array([phi_t]), T)
+
+        dVdT_f = m.dVdT(np.array([phi_f]), T, include_radiation=True, include_SM=True, units=units)
+        dVdT_t = m.dVdT(np.array([phi_t]), T, include_radiation=True, include_SM=True, units=units)
+
+        d2VdT2_f = m.d2VdT2(np.array([phi_f]), T, include_radiation=True, include_SM=True, units=units)
+        d2VdT2_t = m.d2VdT2(np.array([phi_t]), T, include_radiation=True, include_SM=True, units=units)
+
+        # ρ = V - T dV/dT, p = -V
+        rho_f_arr[idx] = V_at_f - T * dVdT_f
+        rho_t_arr[idx] = V_at_t - T * dVdT_t
+        p_f_arr[idx] = -V_at_f
+        p_t_arr[idx] = -V_at_t
+
+        # dρ/dT = -T d²V/dT²
+        drho_dT_f_arr[idx] = -T * d2VdT2_f
+        drho_dT_t_arr[idx] = -T * d2VdT2_t
+
+    # Radiation energy density (phase-independent)
+    rho_rad_arr = np.pi**2 * g_rho(Temps_sorted / convert_units[units]) * Temps_sorted**4 / 30
+
+    # Vacuum energy density: ε_vac = -V_min_value (this is at the true vacuum)
+    eps_vac_arr = np.array([-V_min_value[t] for t in Temps_sorted])
+
+    # Nucleation rate: Γ = T^4 (S_3/(2πT))^{3/2} exp(-S_3/T)
+    S3_over_T_arr = np.array([S3overT[t] for t in Temps_sorted])
+    Gamma_arr = Temps_sorted**4 * (S3_over_T_arr / (2 * np.pi))**(3/2) * np.exp(-S3_over_T_arr)
+
+    # Physical constants
+    M_pl_units = M_pl * convert_units[units]
+    c_pref = -4.0 / 243.0 * np.pi * v_w**3
+
+    # Create interpolators for use in ODE
+    from scipy.interpolate import interp1d
+    
+    # Interpolation functions (T is the independent variable)
+    # We need to interpolate backwards since solve_ivp goes from high T to low T
+    interp_rho_f = interp1d(Temps_sorted, rho_f_arr, kind='linear', fill_value='extrapolate')
+    interp_rho_t = interp1d(Temps_sorted, rho_t_arr, kind='linear', fill_value='extrapolate')
+    interp_p_f = interp1d(Temps_sorted, p_f_arr, kind='linear', fill_value='extrapolate')
+    interp_p_t = interp1d(Temps_sorted, p_t_arr, kind='linear', fill_value='extrapolate')
+    interp_drho_f = interp1d(Temps_sorted, drho_dT_f_arr, kind='linear', fill_value='extrapolate')
+    interp_drho_t = interp1d(Temps_sorted, drho_dT_t_arr, kind='linear', fill_value='extrapolate')
+    interp_rho_rad = interp1d(Temps_sorted, rho_rad_arr, kind='linear', fill_value='extrapolate')
+    interp_eps_vac = interp1d(Temps_sorted, eps_vac_arr, kind='linear', fill_value='extrapolate')
+    interp_Gamma = interp1d(Temps_sorted, Gamma_arr, kind='linear', fill_value='extrapolate')
+
+    def get_R_and_H(T, P_f, dP_dT):
+        """Compute R = (dρ/dT)/(ρ+p) and H at temperature T given P_f and dP_f/dT."""
+        rho_f = interp_rho_f(T)
+        rho_t = interp_rho_t(T)
+        p_f = interp_p_f(T)
+        p_t = interp_p_t(T)
+        drho_f = interp_drho_f(T)
+        drho_t = interp_drho_t(T)
+        rho_rad = interp_rho_rad(T)
+        eps_vac = interp_eps_vac(T)
+
+        # Mixed quantities
+        rho_mix = P_f * rho_f + (1.0 - P_f) * rho_t
+        p_mix = P_f * p_f + (1.0 - P_f) * p_t
+        rho_plus_p = rho_mix + p_mix
+
+        # dρ/dT includes contribution from phase change
+        delta_rho = rho_f - rho_t
+        drho_base = P_f * drho_f + (1.0 - P_f) * drho_t
+        drho_mix = drho_base + delta_rho * dP_dT
+
+        # R = (dρ/dT) / (ρ+p)
+        R = drho_mix / rho_plus_p if np.abs(rho_plus_p) > 1e-100 else 0.0
+
+        # Hubble: H² = (ρ_rad + P_f * ε_vac) / 3
+        rho_for_H = rho_rad + P_f * eps_vac
+        H = np.sqrt(np.abs(rho_for_H) / 3.0) / M_pl_units if rho_for_H > 0 else 1e-100
+
+        return R, H
+
+    # ODE approach: evolve the nested integrals as a system
+    # State vector: y = [J, M, K0, K1, K2, K3]
+    # where:
+    #   J = ∫ R dT
+    #   M = ∫ A dT, with A = R/H * exp(J/3)
+    #   K0 = ∫ B dT, with B = R*Γ/H * exp(-J)
+    #   K1 = ∫ B*M dT
+    #   K2 = ∫ B*M² dT
+    #   K3 = ∫ B*M³ dT
+    
+    # And L = K3 - 3*M*K2 + 3*M²*K1 - M³*K0
+    # logP_f = c_pref * L
+
+    def rhs(T, y):
+        """Right-hand side of the ODE system."""
+        J, M, K0, K1, K2, K3 = y
+        
+        # Compute L and logP_f
+        L = K3 - 3.0 * M * K2 + 3.0 * M**2 * K1 - M**3 * K0
+        logP_f_current = c_pref * L
+        
+        # P_f = exp(logP_f)
+        P_f = np.exp(logP_f_current) if logP_f_current > -700 else 0.0
+        P_f = min(P_f, 1.0)  # P_f cannot exceed 1
+        
+        # dlogP_f/dT = c_pref * dL/dT
+        # We need to compute this to get dP_f/dT
+        # dL/dT = dK3/dT - 3*M*dK2/dT - 3*dM/dT*K2 + 6*M*dM/dT*K1 + 3*M²*dK1/dT - 3*M²*dK0/dT*... 
+        # This is getting complicated. Let's use the chain rule:
+        # dP_f/dT = P_f * dlogP_f/dT = P_f * c_pref * dL/dT
+        
+        # Get R and H using P_f, but we need dP_dT which depends on what we're computing.
+        # Use a simplified approach: assume dP_dT from the current derivative
+        
+        # First, get R and H without the latent heat term
+        R_base, H = get_R_and_H(T, P_f, 0.0)
+        
+        Gamma = interp_Gamma(T)
+        
+        # Compute derivatives of state variables
+        exp_J_3 = np.exp(J / 3.0)
+        exp_neg_J = np.exp(-J)
+        
+        A = R_base / H * exp_J_3 if H > 1e-100 else 0.0
+        B = R_base * Gamma / H * exp_neg_J if H > 1e-100 else 0.0
+        
+        dJ_dT = R_base
+        dM_dT = A
+        dK0_dT = B
+        dK1_dT = B * M
+        dK2_dT = B * M**2
+        dK3_dT = B * M**3
+        
+        return [dJ_dT, dM_dT, dK0_dT, dK1_dT, dK2_dT, dK3_dT]
+
+    # Solve ODE from T_max to T_min
+    T_max = Temps_sorted[0]
+    T_min = Temps_sorted[-1]
+    
+    # Skip T = 0 which is singular
+    if T_min == 0:
+        T_min = Temps_sorted[-2] if n_temps > 1 else T_max / 2
+    
+    # Initial conditions at T_max: all integrals are zero
+    y0 = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    
+    # Solve the ODE (note: T decreasing, so we integrate "backwards")
+    sol = solve_ivp(rhs, [T_max, T_min], y0, t_eval=Temps_sorted[Temps_sorted > 0], 
+                    method='RK45', dense_output=True, max_step=1.0)
+    
+    # Extract results at the original temperature points
+    logP_f_out = np.zeros(n_temps)
+    R_out = np.zeros(n_temps)
+    H_out = np.zeros(n_temps)
+    V_ext_out = np.zeros(n_temps)
+    I_out = np.zeros(n_temps)
+    
+    for idx, T in enumerate(Temps_sorted):
+        if T <= 0:
+            logP_f_out[idx] = logP_f_out[idx - 1] if idx > 0 else 0.0
+            R_out[idx] = np.nan
+            H_out[idx] = np.nan
+            V_ext_out[idx] = V_ext_out[idx - 1] if idx > 0 else 0.0
+            I_out[idx] = np.nan
+            continue
+            
+        if T >= T_max:
+            J, M, K0, K1, K2, K3 = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        elif T < sol.t[-1]:
+            # T is below the solver's range
+            J, M, K0, K1, K2, K3 = sol.y[:, -1]
+        else:
+            y_at_T = sol.sol(T)
+            J, M, K0, K1, K2, K3 = y_at_T
+        
+        # L formula with sign corrected for integration direction (high T to low T)
+        # The original formula integrates from current T upward to T_max
+        # Our ODE integrates from T_max downward, so we negate L
+        L = -(K3 - 3.0 * M * K2 + 3.0 * M**2 * K1 - M**3 * K0)
+        logP_f_out[idx] = c_pref * L
+        V_ext_out[idx] = -logP_f_out[idx]
+        
+        P_f = np.exp(logP_f_out[idx]) if logP_f_out[idx] > -700 else 0.0
+        P_f = min(P_f, 1.0)
+        
+        R, H = get_R_and_H(T, P_f, 0.0)
+        R_out[idx] = R
+        H_out[idx] = H
+        
+        if idx > 0:
+            dT = Temps_sorted[idx] - Temps_sorted[idx - 1]
+            I_out[idx] = (V_ext_out[idx] - V_ext_out[idx - 1]) / dT if dT != 0 else 0.0
+
+    # Output is reversed to match the convention of other functions (low T to high T)
+    if return_all:
+        return (
+            logP_f_out[::-1],          # log(P_f)
+            Temps_sorted[::-1],         # Temperatures
+            R_out[::-1],                # R = (dρ/dT)/(ρ+p)
+            Gamma_arr[::-1],            # Nucleation rate
+            H_out[::-1],                # Hubble parameter
+            V_ext_out[::-1],            # V_ext = -log(P_f)
+            I_out[::-1],                # Integrand dV_ext/dT
+            rho_f_arr[::-1],            # Energy density in false vacuum
+            rho_t_arr[::-1],            # Energy density in true vacuum
+            (rho_f_arr + p_f_arr)[::-1], # ρ + p for false vacuum
+            (rho_t_arr + p_t_arr)[::-1], # ρ + p for true vacuum
+            (rho_f_arr - rho_t_arr)[::-1] # Latent heat density
+        )
+    else:
+        return logP_f_out[::-1], Temps_sorted[::-1], R_out[::-1], Gamma_arr[::-1], H_out[::-1]
 
 
 def N_bubblesH(Temps, Gamma, logP_f, H, ratio_V):

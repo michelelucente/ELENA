@@ -113,3 +113,7 @@ If you use ELENA in your research, please cite:
 
 ELENA is distributed under the **GNU GPL v3.0** license. This means you are free to use, share, and modify the software (including for research or commercial purposes) as long as any version you distribute based on this code remains **open-source under the same license** and **credits the original authors**.
 Please read the accompanying LICENSE document for more details of the GPL-3.0 license.
+
+## Acknowledgements
+During the development of this project, ML was funded by the European Union under the Horizon Europe's Marie Sklodowska-Curie project 101068791 — NuBridge.
+<img width="4125" height="919" alt="EN_FundedbytheEU_RGB_POS" src="https://github.com/user-attachments/assets/fe267e6c-7da3-459e-bdb7-7917d6635b32" />

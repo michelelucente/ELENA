@@ -104,8 +104,12 @@ If you use ELENA in your research, please cite:
     eprint = "2510.00289",
     archivePrefix = "arXiv",
     primaryClass = "hep-ph",
-    month = "9",
-    year = "2025"
+    doi = "10.1140/epjc/s10052-026-16003-5",
+    journal = "Eur. Phys. J. C",
+    volume = "86",
+    number = "7",
+    pages = "851",
+    year = "2026"
 }
 ```
 
